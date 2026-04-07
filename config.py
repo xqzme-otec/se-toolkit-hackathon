@@ -10,7 +10,7 @@ class Config:
 
     # LLM
     LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "openrouter").lower()
-    LLM_MODEL: str = os.getenv("LLM_MODEL", "qwen3:4b")
+    LLM_MODEL: str = os.getenv("LLM_MODEL", "openai/gpt-oss-120b:free")
     LLM_BASE_URL: str = os.getenv(
         "LLM_BASE_URL", "http://localhost:11434"
     )
@@ -40,8 +40,8 @@ class Config:
     def validate(cls) -> None:
         errors = []
         if not cls.BOT_TOKEN:
-            errors.append("BOT_TOKEN не задан")
+            errors.append("BOT_TOKEN is not set")
         if cls.LLM_PROVIDER == "openrouter" and not cls.OPENROUTER_API_KEY:
-            errors.append("OPENROUTER_API_KEY не задан (для openrouter)")
+            errors.append("OPENROUTER_API_KEY is not set (for openrouter)")
         if errors:
-            raise ValueError("Ошибки конфигурации:\n" + "\n".join(f"  • {e}" for e in errors))
+            raise ValueError("Configuration errors:\n" + "\n".join(f"  • {e}" for e in errors))

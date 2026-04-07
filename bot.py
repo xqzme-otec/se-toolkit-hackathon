@@ -1,40 +1,58 @@
 import asyncio
 import logging
 import math
+import re
+from datetime import datetime
 
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
 
 from config import Config
 from llm import parse_intent, LLMParseError
 
-# ─── Настройка логирования ───────────────────────────────────────────
+# ─── Logging ─────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# ─── Инициализация ───────────────────────────────────────────────────
+# ─── Init ────────────────────────────────────────────────────────────
 Config.validate()
 
 if Config.use_sqlite():
     from db_sqlite import DatabaseSQLite
     db = DatabaseSQLite()
-    log.info("Используется SQLite (debtors.db)")
+    log.info("Using SQLite (data/debtors.db)")
 else:
     from db import Database
     db = Database(dsn=Config.database_url())
-    log.info("Используется PostgreSQL")
+    log.info("Using PostgreSQL")
 
 bot = Bot(token=Config.BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 
-# ─── Константы ───────────────────────────────────────────────────────
+# ─── Constants ───────────────────────────────────────────────────────
 LIST_PAGE_SIZE = 10
+REMINDER_INTERVAL = 3600  # check reminders every hour
 
-# ─── Вспомогательные функции ─────────────────────────────────────────
+# ─── FSM States ──────────────────────────────────────────────────────
+class AddDebtState:
+    waiting_name = "add:waiting_name"
+    waiting_amount = "add:waiting_amount"
+    waiting_date = "add:waiting_date"
+
+# ─── Helpers ─────────────────────────────────────────────────────────
 
 def _format_amount(amount: int) -> str:
-    """Склонение слова «рубль»."""
+    """Format amount with ruble pluralization."""
     n = abs(amount) % 100
     last_digit = n % 10
     if 11 <= n <= 19:
@@ -47,7 +65,7 @@ def _format_amount(amount: int) -> str:
 
 
 def _parse_command_args(text: str) -> tuple[str | None, int | None]:
-    """Парсит аргументы команды: имя и сумму."""
+    """Parse command arguments: name and amount."""
     parts = text.strip().split()
     if len(parts) < 2:
         return None, None
@@ -59,45 +77,57 @@ def _parse_command_args(text: str) -> tuple[str | None, int | None]:
     return name, amount
 
 
-def _validate_amount(amount: int) -> bool:
-    """Проверяет, что сумма положительная."""
-    if amount <= 0:
-        return False
-    return True
+def _parse_date(text: str) -> str | None:
+    """Try to extract DD.MM.YYYY from text."""
+    m = re.search(r"(\d{2}\.\d{2}\.\d{4})", text)
+    return m.group(1) if m else None
+
+
+def _build_main_keyboard() -> ReplyKeyboardMarkup:
+    """Main menu keyboard."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="➕ Добавить долг"), KeyboardButton(text="➖ Уменьшить долг")],
+            [KeyboardButton(text="📋 Список должников"), KeyboardButton(text="🔍 Проверить долг")],
+            [KeyboardButton(text="🗑 Удалить должника")],
+        ],
+        resize_keyboard=True,
+    )
 
 
 def _build_list_keyboard(page: int, total_pages: int) -> InlineKeyboardMarkup:
-    """Создаёт inline-клавиатуру с кнопками навигации по страницам."""
+    """Pagination keyboard for /list."""
     buttons = []
     row = []
     if page > 1:
-        row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"list:{page - 1}"))
+        row.append(InlineKeyboardButton(text="⬅️ Back", callback_data=f"list:{page - 1}"))
     if page < total_pages:
-        row.append(InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"list:{page + 1}"))
+        row.append(InlineKeyboardButton(text="Forward ➡️", callback_data=f"list:{page + 1}"))
     if row:
         buttons.append(row)
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-# ─── Команды ─────────────────────────────────────────────────────────
+# ─── Commands ────────────────────────────────────────────────────────
 
 @dp.message(Command("start", "help"))
 async def cmd_help(message: Message):
     help_text = (
-        "📋 *Бот для учёта должников*\n\n"
-        "*Команды:*\n"
-        "/add [имя] [сумма] — добавить должника или увеличить долг\n"
-        "/remove [имя] [сумма] — уменьшить долг\n"
-        "/list — показать всех должников\n"
-        "/check [имя] — узнать долг конкретного человека\n"
-        "/clear [имя] — удалить должника из базы\n\n"
-        "💬 Можно писать простым языком:\n"
-        "• _Саня должен мне 500 рублей_\n"
-        "• _Сколько мне должен Саня?_\n"
-        "• _Кто мне должен?_\n"
-        "• _Петя отдал 300_"
+        "📋 *Debtor Tracking Bot*\n\n"
+        "*Commands:*\n"
+        "/add [name] [amount] — add debtor or increase debt\n"
+        "/remove [name] [amount] — decrease debt\n"
+        "/list — show all debtors\n"
+        "/check [name] — check specific person's debt\n"
+        "/clear [name] — remove debtor from database\n\n"
+        "💬 You can also use natural language:\n"
+        "• _Sanya owes me 500 rubles_\n"
+        "• _How much does Sanya owe?_\n"
+        "• _Who owes me?_\n"
+        "• _Petya paid back 300_\n\n"
+        "Or use the buttons below 👇"
     )
-    await message.answer(help_text, parse_mode="Markdown")
+    await message.answer(help_text, parse_mode="Markdown", reply_markup=_build_main_keyboard())
 
 
 @dp.message(Command("add"))
@@ -106,14 +136,16 @@ async def cmd_add(message: Message):
     args = message.text.split(maxsplit=1)
     name, amount = _parse_command_args(args[1]) if len(args) > 1 else (None, None)
     if not name or not amount:
-        await message.answer("❌ Использование: /add [имя] [сумма]\nПример: /add Саня 500")
+        await message.answer(
+            "❌ Usage: /add [name] [amount]\nExample: /add Sanya 500\n\n"
+            "Or just press ➕ Add debt button below."
+        )
         return
-    if not _validate_amount(amount):
-        await message.answer("❌ Сумма должна быть положительным числом")
-        return
-    new_amount = await db.add_debt(user_id, name, amount)
+    due_date = _parse_date(args[1]) if len(args) > 1 else None
+    new_amount = await db.add_debt(user_id, name, amount, due_date)
+    date_msg = f"\n📅 Return by: {due_date}" if due_date else ""
     await message.answer(
-        f"✅ Долг {name} увеличен на {_format_amount(amount)}. Теперь: {_format_amount(new_amount)}"
+        f"✅ {name}'s debt increased by {_format_amount(amount)}. Now: {_format_amount(new_amount)}{date_msg}"
     )
 
 
@@ -123,17 +155,17 @@ async def cmd_remove(message: Message):
     args = message.text.split(maxsplit=1)
     name, amount = _parse_command_args(args[1]) if len(args) > 1 else (None, None)
     if not name or not amount:
-        await message.answer("❌ Использование: /remove [имя] [сумма]\nПример: /remove Саня 200")
+        await message.answer("❌ Usage: /remove [name] [amount]\nExample: /remove Sanya 200")
         return
     result = await db.remove_debt(user_id, name, amount)
     if result is None:
-        await message.answer(f"❌ {name} не найден в вашей базе должников")
+        await message.answer(f"❌ {name} not found in your debtor database")
         return
     if result == 0:
-        await message.answer(f"✅ Долг {name} полностью погашен и удалён из базы")
+        await message.answer(f"✅ {name}'s debt is fully paid and removed from database")
     else:
         await message.answer(
-            f"✅ Долг {name} уменьшен на {_format_amount(amount)}. Остаток: {_format_amount(result)}"
+            f"✅ {name}'s debt decreased by {_format_amount(amount)}. Remaining: {_format_amount(result)}"
         )
 
 
@@ -144,10 +176,10 @@ async def cmd_list(message: Message):
 
 
 async def _send_list_page(message: Message, user_id: int, page: int):
-    """Отправить одну страницу списка должников."""
+    """Send one page of debtors list."""
     all_debtors = await db.list_debtors(user_id)
     if not all_debtors:
-        await message.answer("📭 Список должников пуст")
+        await message.answer("📭 Debtor list is empty")
         return
 
     total = await db.get_total_debt(user_id)
@@ -157,17 +189,23 @@ async def _send_list_page(message: Message, user_id: int, page: int):
     end = start + LIST_PAGE_SIZE
     page_debtors = all_debtors[start:end]
 
-    lines = [f"• {name}: {_format_amount(amount)}" for name, amount in page_debtors]
-    header = f"📋 *Должники (стр. {page}/{total_pages}):*"
-    text = header + "\n" + "\n".join(lines) + f"\n\n💰 *Итого:* {_format_amount(total)}"
+    lines = []
+    for d in page_debtors:
+        line = f"• {d['name']}: {_format_amount(d['amount'])}"
+        if d["due_date"]:
+            line += f" (📅 {d['due_date']})"
+        lines.append(line)
+
+    header = f"📋 *Debtors (page {page}/{total_pages}):*"
+    text = header + "\n" + "\n".join(lines) + f"\n\n💰 *Total:* {_format_amount(total)}"
 
     keyboard = _build_list_keyboard(page, total_pages) if total_pages > 1 else None
     await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("list:"))
-async def cb_list_page(callback):
-    """Обработка нажатий кнопок пагинации /list."""
+async def cb_list_page(callback: CallbackQuery):
+    """Handle /list pagination button presses."""
     user_id = callback.from_user.id
     page = int(callback.data.split(":")[1])
     await _send_list_page(callback.message, user_id, page)
@@ -179,14 +217,24 @@ async def cmd_check(message: Message):
     user_id = message.from_user.id
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.answer("❌ Использование: /check [имя]\nПример: /check Саня")
+        await message.answer("❌ Usage: /check [name]\nExample: /check Sanya")
         return
     name = args[1].strip()
-    amount = await db.get_debtor(user_id, name)
-    if amount is None:
-        await message.answer(f"📭 {name} нет в вашей базе должников")
+    info = await db.get_debtor(user_id, name)
+    if info is None:
+        await message.answer(f"📭 {name} not in your debtor database")
         return
-    await message.answer(f"💰 {name} должен {_format_amount(amount)}")
+    amount = info["amount"]
+    due = info["due_date"]
+    if amount > 0:
+        text = f"💰 {name} owes you {_format_amount(amount)}"
+    elif amount < 0:
+        text = f"💸 You owe {name} {_format_amount(abs(amount))}"
+    else:
+        text = f"📭 {name} has no debt"
+    if due:
+        text += f"\n📅 Return by: {due}"
+    await message.answer(text)
 
 
 @dp.message(Command("clear"))
@@ -194,19 +242,119 @@ async def cmd_clear(message: Message):
     user_id = message.from_user.id
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.answer("❌ Использование: /clear [имя]\nПример: /clear Саня")
+        await message.answer("❌ Usage: /clear [name]\nExample: /clear Sanya")
         return
     name = args[1].strip()
     if await db.clear_debtor(user_id, name):
-        await message.answer(f"🗑 {name} удалён из вашей базы должников")
+        await message.answer(f"🗑 {name} removed from your debtor database")
     else:
-        await message.answer(f"❌ {name} не найден в вашей базе")
+        await message.answer(f"❌ {name} not found in your database")
 
 
-# ─── Обработка естественного языка (LLM) ─────────────────────────────
+# ─── Button handlers (main menu) ─────────────────────────────────────
+
+@dp.message(F.text == "➕ Добавить долг")
+async def btn_add_start(message: Message, state: FSMContext):
+    await state.set_state(AddDebtState.waiting_name)
+    await message.answer("📝 Введите имя должника:")
+
+
+@dp.message(AddDebtState.waiting_name)
+async def btn_add_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text.strip())
+    await state.set_state(AddDebtState.waiting_amount)
+    await message.answer("💰 Введите сумму (можно с минусом, если должны вы):\n\n"
+                         "Пример: 500 или -200")
+
+
+@dp.message(AddDebtState.waiting_amount)
+async def btn_add_amount(message: Message, state: FSMContext):
+    try:
+        amount = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ Введите целое число. Пример: 500 или -200")
+        return
+    await state.update_data(amount=amount)
+    await state.set_state(AddDebtState.waiting_date)
+    await message.answer(
+        "📅 Введите дату возврата в формате ДД.ММ.ГГГГ (или /skip если не нужно):\n\n"
+        "Пример: 15.05.2026",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="/skip")]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        ),
+    )
+
+
+@dp.message(AddDebtState.waiting_date, Command("skip"))
+@dp.message(AddDebtState.waiting_date, F.text == "/skip")
+async def btn_add_skip_date(message: Message, state: FSMContext):
+    await _finish_add(message, state, due_date=None)
+
+
+@dp.message(AddDebtState.waiting_date)
+async def btn_add_date(message: Message, state: FSMContext):
+    due_date = _parse_date(message.text)
+    if not due_date:
+        await message.answer("❌ Неверный формат. Введите дату как ДД.ММ.ГГГГ\nПример: 15.05.2026")
+        return
+    await _finish_add(message, state, due_date=due_date)
+
+
+async def _finish_add(message: Message, state: FSMContext, due_date: str | None):
+    data = await state.get_data()
+    name = data["name"]
+    amount = data["amount"]
+    user_id = message.from_user.id
+    new_amount = await db.add_debt(user_id, name, amount, due_date)
+    date_msg = f"\n📅 Return by: {due_date}" if due_date else ""
+    await message.answer(
+        f"✅ {name}: {_format_amount(amount)}. Now: {_format_amount(new_amount)}{date_msg}",
+        reply_markup=_build_main_keyboard(),
+    )
+    await state.clear()
+
+
+@dp.message(F.text == "➖ Уменьшить долг")
+async def btn_remove(message: Message):
+    await message.answer(
+        "Используйте команду:\n/remove [имя] [сумма]\n\n"
+        "Пример: /remove Саня 200"
+    )
+
+
+@dp.message(F.text == "📋 Список должников")
+async def btn_list(message: Message):
+    user_id = message.from_user.id
+    await _send_list_page(message, user_id, page=1)
+
+
+@dp.message(F.text == "🔍 Проверить долг")
+async def btn_check(message: Message):
+    await message.answer(
+        "Используйте команду:\n/check [имя]\n\n"
+        "Пример: /check Саня"
+    )
+
+
+@dp.message(F.text == "🗑 Удалить должника")
+async def btn_clear(message: Message):
+    await message.answer(
+        "Используйте команду:\n/clear [имя]\n\n"
+        "Пример: /clear Саня"
+    )
+
+
+# ─── Natural language (LLM) ──────────────────────────────────────────
 
 @dp.message()
-async def handle_natural_language(message: Message):
+async def handle_natural_language(message: Message, state: FSMContext):
+    # Skip if in FSM state
+    current_state = await state.get_state()
+    if current_state:
+        return
+
     user_id = message.from_user.id
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
 
@@ -220,81 +368,139 @@ async def handle_natural_language(message: Message):
             user_id=user_id,
         )
     except Exception as e:
-        log.exception("Ошибка при запросе к LLM")
+        log.exception("LLM request error")
         await message.answer(
-            "⚠️ Ошибка при обработке запроса. Попробуйте позже или используйте команды."
+            "⚠️ Error processing request. Try again later or use commands."
         )
         return
 
     intent = result["intent"]
     name = result.get("name")
     amount = result.get("amount")
+    due_date = result.get("due_date")
 
     if intent == "unknown" or (intent not in ("list",) and not name):
         await message.answer(
-            "🤔 Не удалось понять, что вы хотите. Попробуйте переформулировать "
-            "или используйте команды:\n/add, /remove, /list, /check, /clear"
+            "🤔 Couldn't understand. Try rephrasing or use commands:\n"
+            "/add, /remove, /list, /check, /clear"
         )
         return
 
     if intent == "add":
-        if not amount or not _validate_amount(amount):
-            await message.answer("❌ Укажите положительную сумму. Пример: /add Саня 500")
+        if not amount:
+            await message.answer("❌ Specify an amount. Example: /add Sanya 500")
             return
-        new_amount = await db.add_debt(user_id, name, amount)
-        await message.answer(
-            f"✅ Долг {name}: {_format_amount(amount)}. Теперь: {_format_amount(new_amount)}"
-        )
+        new_amount = await db.add_debt(user_id, name, amount, due_date)
+        date_msg = f"\n📅 Return by: {due_date}" if due_date else ""
+        if new_amount > 0:
+            await message.answer(
+                f"✅ {name} owes {_format_amount(new_amount)}{date_msg}"
+            )
+        elif new_amount < 0:
+            await message.answer(
+                f"✅ You owe {name} {_format_amount(abs(new_amount))}{date_msg}"
+            )
+        else:
+            await message.answer(f"✅ {name} has no debt now{date_msg}")
 
     elif intent == "remove":
-        if not amount or amount <= 0:
-            await message.answer("❌ Укажите сумму. Пример: /remove Саня 200")
+        if not amount:
+            await message.answer("❌ Specify an amount. Example: /remove Sanya 200")
             return
         res = await db.remove_debt(user_id, name, amount)
         if res is None:
-            await message.answer(f"❌ {name} не найден в вашей базе")
+            await message.answer(f"❌ {name} not found in your database")
             return
         if res == 0:
-            await message.answer(f"✅ Долг {name} полностью погашен")
+            await message.answer(f"✅ {name}'s debt is fully paid")
         else:
             await message.answer(
-                f"✅ Долг {name} уменьшен на {_format_amount(amount)}. Остаток: {_format_amount(res)}"
+                f"✅ {name}'s debt decreased by {_format_amount(amount)}. Remaining: {_format_amount(res)}"
             )
 
     elif intent == "check":
-        debt = await db.get_debtor(user_id, name)
-        if debt is None:
-            await message.answer(f"📭 {name} нет в вашей базе должников")
+        info = await db.get_debtor(user_id, name)
+        if info is None:
+            await message.answer(f"📭 {name} not in your database")
+            return
+        a = info["amount"]
+        if a > 0:
+            text = f"💰 {name} owes you {_format_amount(a)}"
+        elif a < 0:
+            text = f"💸 You owe {name} {_format_amount(abs(a))}"
         else:
-            await message.answer(f"💰 {name} должен {_format_amount(debt)}")
+            text = f"📭 {name} has no debt"
+        if info["due_date"]:
+            text += f"\n📅 Return by: {info['due_date']}"
+        await message.answer(text)
 
     elif intent == "list":
         all_debtors = await db.list_debtors(user_id)
         if not all_debtors:
-            await message.answer("📭 Список должников пуст")
+            await message.answer("📭 Debtor list is empty")
             return
         total = await db.get_total_debt(user_id)
         total_pages = math.ceil(len(all_debtors) / LIST_PAGE_SIZE)
         page_debtors = all_debtors[:LIST_PAGE_SIZE]
-        lines = [f"• {n}: {_format_amount(a)}" for n, a in page_debtors]
-        header = f"📋 *Должники (стр. 1/{total_pages}):*"
-        text = header + "\n" + "\n".join(lines) + f"\n\n💰 *Итого:* {_format_amount(total)}"
+        lines = []
+        for d in page_debtors:
+            line = f"• {d['name']}: {_format_amount(d['amount'])}"
+            if d["due_date"]:
+                line += f" (📅 {d['due_date']})"
+            lines.append(line)
+        header = f"📋 *Debtors (page 1/{total_pages}):*"
+        text = header + "\n" + "\n".join(lines) + f"\n\n💰 *Total:* {_format_amount(total)}"
         keyboard = _build_list_keyboard(1, total_pages) if total_pages > 1 else None
         await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
 
     elif intent == "clear":
         if await db.clear_debtor(user_id, name):
-            await message.answer(f"🗑 {name} удалён из базы")
+            await message.answer(f"🗑 {name} removed from database")
         else:
-            await message.answer(f"❌ {name} не найден в вашей базе")
+            await message.answer(f"❌ {name} not found in database")
 
 
-# ─── Запуск ──────────────────────────────────────────────────────────
+# ─── Reminder background task ────────────────────────────────────────
+
+async def reminder_task():
+    """Check every REMINDER_INTERVAL and notify users about debtors due tomorrow."""
+    log.info("Reminder task started")
+    while True:
+        try:
+            due_tomorrow = await db.get_all_due_tomorrow()
+            if due_tomorrow:
+                # Group by user_id
+                users: dict[int, list] = {}
+                for uid, name, amount, dd in due_tomorrow:
+                    users.setdefault(uid, []).append((name, amount, dd))
+
+                for uid, debtors in users.items():
+                    lines = [
+                        f"• {n} — {_format_amount(a)}" for n, a, _ in debtors
+                    ]
+                    text = "⏰ *Reminder — tomorrow these debtors should pay you back:*\n" + "\n".join(lines)
+                    try:
+                        await bot.send_message(uid, text, parse_mode="Markdown")
+                    except Exception as e:
+                        log.warning("Failed to send reminder to user %s: %s", uid, e)
+
+            log.debug("Reminder check done, %d debtors due tomorrow", len(due_tomorrow))
+        except Exception as e:
+            log.exception("Error in reminder task")
+
+        await asyncio.sleep(REMINDER_INTERVAL)
+
+
+# ─── Start ───────────────────────────────────────────────────────────
 
 async def main():
-    log.info("Инициализация базы данных...")
+    log.info("Initializing database...")
     await db.init()
-    log.info("Запуск бота...")
+    log.info("Starting bot...")
+
+    # Start reminder background task
+    asyncio.create_task(reminder_task())
+
     try:
         await dp.start_polling(bot)
     finally:
