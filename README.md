@@ -1,90 +1,119 @@
-# 📋 DebtorBot — Telegram-бот для учёта должников
+# SE Toolkit Hackathon — Telegram Debtor Bot
 
-Бот помогает отслеживать, кто вам должен. Каждый пользователь видит только своих должников.
+A Telegram bot for tracking personal debts with natural language understanding powered by LLM.
 
-## Возможности
+## Features
 
-- **Команды:** `/add`, `/remove`, `/list`, `/check`, `/clear`
-- **Естественный язык:** «Саня должен 500», «Петя отдал 300», «Кто мне должен?»
-- **Пагинация:** автоматическое разбиение списка при >10 записях
-- **Валидация:** нельзя добавить долг ≤ 0
-- **Изоляция:** каждый пользователь видит только свои данные
-- **PostgreSQL:** надёжное хранение с историей транзакций
+- **Commands**: `/add`, `/remove`, `/list`, `/check`, `/clear`
+- **Natural language**: "Sanya owes me 500", "Who owes me?", "Petya paid back 300"
+- **Multi-user**: each Telegram user has their own isolated debtor list
+- **Pagination**: automatic page splitting when the list exceeds 10 entries
+- **Validation**: prevents zero or negative amounts
+- **Transaction history**: every change is logged in the database
+- **LLM providers**: OpenRouter API or local Ollama (switchable via `.env`)
+- **SQLite / PostgreSQL**: SQLite by default, PostgreSQL available via Docker Compose
 
-## Быстрый старт
+## Quick Start
 
-### 1. Получи токены
-
-- **BOT_TOKEN** — напиши [@BotFather](https://t.me/BotFather) в Telegram
-- **OPENROUTER_API_KEY** — зарегистрируйся на [openrouter.ai/keys](https://openrouter.ai/keys)
-
-### 2. Запуск локально
+### Local Run
 
 ```bash
-# Установи зависимости
 pip install -r requirements.txt
-
-# Создай .env файл
-cp .env.example .env
-# Заполни BOT_TOKEN и OPENROUTER_API_KEY
-
-# Запусти бота
+cp .env.example .env   # fill in BOT_TOKEN and OPENROUTER_API_KEY
 python bot.py
 ```
 
-### 3. Запуск через Docker
+### Docker Compose
 
 ```bash
-cp .env.example .env
-# Заполни BOT_TOKEN и OPENROUTER_API_KEY
-
+cp .env.example .env   # fill in BOT_TOKEN and OPENROUTER_API_KEY
 docker compose up -d --build
 ```
 
-## Команды
+## Commands
 
-| Команда | Описание | Пример |
+| Command | Description | Example |
 |---|---|---|
-| `/add [имя] [сумма]` | Добавить должника или увеличить долг | `/add Саня 500` |
-| `/remove [имя] [сумма]` | Уменьшить долг | `/remove Саня 200` |
-| `/list` | Показать всех должников (с пагинацией) | `/list` |
-| `/check [имя]` | Узнать долг конкретного человека | `/check Саня` |
-| `/clear [имя]` | Удалить должника из базы | `/clear Саня` |
-| `/start`, `/help` | Справка | `/help` |
+| `/add [name] [amount]` | Add a debtor or increase debt | `/add Sanya 500` |
+| `/remove [name] [amount]` | Decrease debt | `/remove Sanya 200` |
+| `/list` | Show all debtors (paginated) | `/list` |
+| `/check [name]` | Check a specific person's debt | `/check Sanya` |
+| `/clear [name]` | Remove a debtor | `/clear Sanya` |
+| `/start`, `/help` | Help message | `/help` |
 
-## Естественный язык
+## Natural Language
 
-Бот понимает фразы вроде:
+The bot understands phrases like:
 
-- «Саня должен мне 500 рублей» → добавит долг
-- «Сколько мне должен Саня?» → покажет долг
-- «Кто мне должен?» → список всех должников
-- «Петя отдал 300» → уменьшит долг
+- "Sanya owes me 500 rubles" → adds debt
+- "How much does Sanya owe?" → shows debt
+- "Who owes me?" → lists all debtors
+- "Petya paid back 300" → reduces debt
 
-## Структура проекта
+## LLM Providers
+
+| Provider | Setup | Notes |
+|---|---|---|
+| **OpenRouter** | `LLM_PROVIDER=openrouter`, set `OPENROUTER_API_KEY` | Free models available, rate-limited |
+| **Ollama** | `LLM_PROVIDER=ollama`, install Ollama locally | No rate limits, runs locally |
+
+### Using Ollama
+
+```bash
+brew install ollama
+ollama serve &
+ollama pull qwen3:4b
+```
+
+Then set in `.env`:
+```
+LLM_PROVIDER=ollama
+LLM_MODEL=qwen3:4b
+LLM_BASE_URL=http://localhost:11434
+```
+
+## Environment Variables
+
+| Variable | Description | Default |
+|---|---|---|
+| `BOT_TOKEN` | Telegram bot token (from @BotFather) | — |
+| `OPENROUTER_API_KEY` | OpenRouter API key | — |
+| `LLM_PROVIDER` | LLM backend: `openrouter` or `ollama` | `openrouter` |
+| `LLM_MODEL` | Model name | `openai/gpt-oss-120b:free` |
+| `LLM_BASE_URL` | LLM API base URL | OpenRouter URL |
+| `USE_SQLITE` | Use SQLite instead of PostgreSQL | `1` |
+| `POSTGRES_HOST` | PostgreSQL host | `localhost` |
+| `POSTGRES_PORT` | PostgreSQL port | `5432` |
+| `POSTGRES_DB` | Database name | `debtors` |
+| `POSTGRES_USER` | Database user | `postgres` |
+| `POSTGRES_PASSWORD` | Database password | `postgres` |
+
+## Project Structure
 
 ```
-tgbot/
-├── bot.py              # aiogram бот, хендлеры
-├── db.py               # asyncpg, PostgreSQL
-├── llm.py              # парсинг через OpenRouter API
-├── config.py           # загрузка env-переменных
-├── requirements.txt    # зависимости
-├── Dockerfile          # образ бота
-├── docker-compose.yml  # bot + postgres
-├── .env.example        # шаблон переменных
-└── .gitignore
+├── bot.py              # aiogram bot with handlers
+├── db.py               # asyncpg PostgreSQL driver
+├── db_sqlite.py        # SQLite driver (default)
+├── llm.py              # LLM intent parsing (OpenRouter + Ollama)
+├── config.py           # environment variable loader
+├── requirements.txt    # Python dependencies
+├── Dockerfile          # Docker image
+├── docker-compose.yml  # Docker Compose setup
+├── .env.example        # environment template
+└── README.md
 ```
 
-## Переменные окружения
+## Deploy to VM
 
-| Переменная | Описание | По умолчанию |
-|---|---|---|
-| `BOT_TOKEN` | Токен Telegram-бота | — |
-| `OPENROUTER_API_KEY` | Ключ OpenRouter API | — |
-| `POSTGRES_HOST` | Хост PostgreSQL | `localhost` |
-| `POSTGRES_PORT` | Порт PostgreSQL | `5432` |
-| `POSTGRES_DB` | Имя базы данных | `debtors` |
-| `POSTGRES_USER` | Пользователь БД | `postgres` |
-| `POSTGRES_PASSWORD` | Пароль БД | `postgres` |
-| `LLM_MODEL` | Модель для парсинга | `qwen/qwen3-coder:free` |
+```bash
+# Copy files to VM
+scp -r ./* root@<VM_IP>:/opt/tgbot/
+scp .env root@<VM_IP>:/opt/tgbot/.env
+
+# Build and run on VM
+ssh root@<VM_IP> "cd /opt/tgbot && docker compose up -d --build"
+```
+
+## License
+
+MIT
